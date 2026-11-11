@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/exec"
 	"strconv"
@@ -56,7 +57,18 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 	// setup isn't clearly useful. Documented as a limitation.
 	rtspHost := "127.0.0.1"
 	rtspPort := 8554
-	if cfg.Go2RTCURL != "" {
+	// GWELL_PUBLISH_RTSP=host:port sends the Gwell streams to another
+	// RTSP server (e.g. a mediamtx next to the bridge) instead of the
+	// embedded go2rtc.
+	if cfg.GwellPublishRTSP != "" {
+		host, port, err := net.SplitHostPort(cfg.GwellPublishRTSP)
+		if p, perr := strconv.Atoi(port); err == nil && perr == nil {
+			rtspHost, rtspPort = host, p
+		} else {
+			log.Warn().Str("value", cfg.GwellPublishRTSP).Msg("GWELL_PUBLISH_RTSP is not host:port; using go2rtc")
+		}
+	}
+	if cfg.Go2RTCURL != "" && cfg.GwellPublishRTSP == "" {
 		log.Warn().
 			Str("url", cfg.Go2RTCURL).
 			Msg("GO2RTC_URL is set; gwell-proxy will still publish to 127.0.0.1:8554 — configure the remote go2rtc to ingest if you need Gwell cameras there")
@@ -79,6 +91,15 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 	}
 	if cfg.GwellKeepPublisher {
 		extraArgs = append(extraArgs, "--keep-publisher")
+	}
+	// GWELL_ON_DEMAND: the camera streams only while a viewer holds
+	// GET /demand/<stream> open on the control port (a media server's
+	// on-demand hook). GET /health on the same port lists the cameras.
+	if cfg.GwellOnDemand {
+		extraArgs = append(extraArgs, "--on-demand", "--control-addr", fmt.Sprintf(":%d", cfg.GwellControlPort))
+		if cfg.GwellDemandGrace > 0 {
+			extraArgs = append(extraArgs, "--demand-grace", cfg.GwellDemandGrace.String())
+		}
 	}
 
 	backoff := 2 * time.Second

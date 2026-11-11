@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -65,7 +66,15 @@ type proxyOpts struct {
 	relayKeepalive string
 	legacyRelayReplies bool
 	escapeNAL          bool
+	onDemand           bool
+	demandGrace        time.Duration
 }
+
+// demand tracks viewers per stream (-on-demand) and serves -control-addr.
+var demand = newDemandHub()
+
+// errNoViewers ends a session when -on-demand sees no viewer.
+var errNoViewers = errors.New("no viewers")
 
 var opts proxyOpts
 
@@ -180,6 +189,9 @@ func main() {
 	flag.StringVar(&opts.relayKeepalive, "relay-keepalive", "both", "UDP relay keepalive sent every 10s while streaming: both|relay|server|none")
 	flag.BoolVar(&opts.legacyRelayReplies, "legacy-relay-replies", false, "answer frames from a UDP relay with standard (not extended) MTP frames, as before; for A/B tests only")
 	flag.BoolVar(&opts.escapeNAL, "escape-nal", true, "rewrite each H.264 NAL unit with valid emulation prevention bytes and drop invalid units before ffmpeg; Wyze Cam OG slices carry unescaped zero runs that hardware decoders (Apple VideoToolbox in Chrome/Safari) reject")
+	controlAddr := flag.String("control-addr", "", "listen address of the control API (GET /health, GET /demand/<stream>), e.g. :18564; empty = off")
+	flag.BoolVar(&opts.onDemand, "on-demand", false, "stream a camera only while a GET /demand/<stream> request is open on -control-addr (e.g. a mediamtx runOnDemand hook)")
+	flag.DurationVar(&opts.demandGrace, "demand-grace", 10*time.Second, "with -on-demand: end the session after the last viewer has been gone this long")
 	flag.BoolVar(&opts.keepPublisher, "keep-publisher", false, "keep the ffmpeg RTSP publisher (and so the go2rtc producer) alive across P2P reconnects; viewers see a short freeze instead of a stream restart")
 	flag.Parse()
 	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v escape-nal=%v", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher, opts.escapeNAL)
@@ -192,6 +204,17 @@ func main() {
 	}
 
 	log.Printf("[main] shim=%s RTSP=%s:%d", *apiURL, *rtspHost, *rtspPort)
+	if opts.onDemand && *controlAddr == "" {
+		log.Fatalf("[main] -on-demand needs -control-addr")
+	}
+	if *controlAddr != "" {
+		go func() {
+			log.Printf("[main] control API on %s (on-demand=%v grace=%s)", *controlAddr, opts.onDemand, opts.demandGrace)
+			if err := http.ListenAndServe(*controlAddr, demand.handler(opts.onDemand)); err != nil {
+				log.Fatalf("[main] control API: %v", err)
+			}
+		}()
+	}
 
 	client := newWyzeShimClient(*apiURL)
 
@@ -233,7 +256,9 @@ func main() {
 	stopCh := make(chan struct{})
 
 	for i, camID := range cameraIDs {
-		if i > 0 {
+		// On demand a camera only registers here; connectMu still keeps
+		// handshakes one at a time.
+		if i > 0 && !opts.onDemand {
 			log.Printf("[main] Staggering camera start (%s)...", cameraStagger)
 			time.Sleep(cameraStagger)
 		}
@@ -336,6 +361,11 @@ func runCamera(client *wyzeShimClient, cameraID string,
 
 	pub := &publisher{}
 	defer pub.close()
+	streamPath, ok := resolveStreamPath(client, cameraID, stopCh)
+	if !ok {
+		return
+	}
+	demand.register(cameraID, streamPath)
 	delay := opts.reconnectDelay
 	var lastMint time.Time
 	lastStreamed := false
@@ -345,6 +375,13 @@ func runCamera(client *wyzeShimClient, cameraID string,
 			log.Printf("[%s] Stop signal received", cameraID)
 			return
 		default:
+		}
+		if opts.onDemand && demand.idleFor(streamPath) > 0 {
+			log.Printf("[%s] on-demand: idle, waiting for a viewer of %s", cameraID, streamPath)
+			if !demand.waitDemand(streamPath, stopCh) {
+				return
+			}
+			log.Printf("[%s] on-demand: viewer for %s, starting session", cameraID, streamPath)
 		}
 
 		// Mint a fresh token after a failed handshake or when the last
@@ -377,9 +414,15 @@ func runCamera(client *wyzeShimClient, cameraID string,
 		}
 
 		started := time.Now()
-		streamed, err := streamCamera(client, cameraID, pub, rtspHost, rtspPort, dumpDir, ffmpegLogLevel, deadmanTimeout, stopCh)
-		if !opts.keepPublisher {
+		streamed, err := streamCamera(client, cameraID, streamPath, pub, rtspHost, rtspPort, dumpDir, ffmpegLogLevel, deadmanTimeout, stopCh)
+		if !opts.keepPublisher || errors.Is(err, errNoViewers) {
 			pub.close()
+		}
+		if errors.Is(err, errNoViewers) {
+			log.Printf("[%s] on-demand: no viewers for %s, session stopped after %s", cameraID, opts.demandGrace, time.Since(started).Round(time.Second))
+			delay = opts.reconnectDelay
+			lastStreamed = streamed
+			continue
 		}
 		// A session that streamed and then stalled reconnects after the
 		// base delay: the relay path is gone, a new session is the only
@@ -417,25 +460,13 @@ func runCamera(client *wyzeShimClient, cameraID string,
 // streamCamera runs a single streaming session for one camera.
 // It acquires connectMu to serialize the P2P handshake phase.
 // It returns streamed=true when the session reached the streaming state.
-func streamCamera(client *wyzeShimClient, cameraID string, pub *publisher,
+func streamCamera(client *wyzeShimClient, cameraID, streamPath string, pub *publisher,
 	rtspHost string, rtspPort int, dumpDir string, ffmpegLogLevel string, deadmanTimeout time.Duration, stopCh chan struct{}) (streamed bool, err error) {
 
 	// Get device info for stream name and LAN IP
 	info, err := client.GetDeviceInfo(cameraID)
 	if err != nil {
 		return false, fmt.Errorf("get device info: %w", err)
-	}
-
-	streamName := info.StreamName
-	if streamName == "" {
-		streamName = cameraID
-	}
-	streamPath := streamName
-	// Bridge convention: stream paths land at rtsp://go2rtc:8554/<name>
-	// directly (no "live/" prefix that upstream mediamtx convention used).
-	// If your go2rtc is configured to expect a prefix, set GWELL_STREAM_PREFIX.
-	if prefix := os.Getenv("GWELL_STREAM_PREFIX"); prefix != "" && !strings.HasPrefix(streamPath, prefix) {
-		streamPath = prefix + streamPath
 	}
 
 	log.Printf("[%s] Starting stream: %s (LAN IP: %s)", cameraID, streamPath, info.LanIP)
@@ -519,11 +550,13 @@ func streamCamera(client *wyzeShimClient, cameraID string, pub *publisher,
 		LegacyRelayReplies: opts.legacyRelayReplies,
 		OnStreaming: func() {
 			streamedFlag.Store(true)
+			demand.setStreaming(streamPath, true)
 			// Give the P2P server a moment before the next handshake.
 			time.AfterFunc(2*time.Second, unlock)
 		},
 	})
 	defer func() { streamed = streamedFlag.Load() }()
+	defer demand.setStreaming(streamPath, false)
 
 	// Run the session — it will go through connect, certify, initInfo,
 	// subscribe, calling, and then enter streamLoop. We release the
@@ -566,8 +599,17 @@ func streamCamera(client *wyzeShimClient, cameraID string, pub *publisher,
 				return false, fmt.Errorf("ffmpeg process died")
 			}
 
+			// On demand: nobody watches any more.
+			if opts.onDemand && demand.idleFor(streamPath) > opts.demandGrace {
+				sess.Close()
+				return false, errNoViewers
+			}
+
 			// Deadman switch: no data for too long
 			last := tracker.lastWriteTime()
+			if streamedFlag.Load() {
+				demand.setLastData(streamPath, last)
+			}
 			if !last.IsZero() && time.Since(last) > deadmanTimeout {
 				sess.Close()
 				return false, fmt.Errorf("deadman timeout: no stream data for %s", deadmanTimeout)
@@ -628,5 +670,33 @@ func (p *publisher) close() {
 	if p.ff != nil {
 		p.ff.Close()
 		p.ff = nil
+	}
+}
+
+// resolveStreamPath returns the RTSP path of a camera: its stream name
+// from the shim (the camera ID when empty), with GWELL_STREAM_PREFIX. It
+// retries until the shim answers or stop closes.
+func resolveStreamPath(client *wyzeShimClient, cameraID string, stopCh chan struct{}) (string, bool) {
+	for {
+		info, err := client.GetDeviceInfo(cameraID)
+		if err == nil {
+			streamPath := info.StreamName
+			if streamPath == "" {
+				streamPath = cameraID
+			}
+			// Bridge convention: stream paths land at rtsp://go2rtc:8554/<name>
+			// directly (no "live/" prefix that upstream mediamtx convention used).
+			// If your go2rtc is configured to expect a prefix, set GWELL_STREAM_PREFIX.
+			if prefix := os.Getenv("GWELL_STREAM_PREFIX"); prefix != "" && !strings.HasPrefix(streamPath, prefix) {
+				streamPath = prefix + streamPath
+			}
+			return streamPath, true
+		}
+		log.Printf("[%s] get device info: %v (retrying in 10s)", cameraID, err)
+		select {
+		case <-stopCh:
+			return "", false
+		case <-time.After(10 * time.Second):
+		}
 	}
 }

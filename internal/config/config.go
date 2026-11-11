@@ -131,6 +131,9 @@ type Config struct {
 	GwellStallTimeout    time.Duration // gwell-proxy -stall-timeout (0 = off)
 	GwellReconnectDelay  time.Duration // gwell-proxy -reconnect-delay (0 = proxy default)
 	GwellKeepPublisher   bool          // gwell-proxy -keep-publisher
+	GwellOnDemand        bool          // gwell-proxy -on-demand (control API on GwellControlPort)
+	GwellDemandGrace     time.Duration // gwell-proxy -demand-grace (0 = proxy default)
+	GwellPublishRTSP     string        // host:port gwell-proxy publishes to (empty = embedded go2rtc 127.0.0.1:8554)
 	// ModelOverrides is the raw MODEL_OVERRIDES string applied to the
 	// wyzeapi model registry at startup. See wyzeapi.ApplyModelOverrides.
 	ModelOverrides string
@@ -269,6 +272,9 @@ func Load() (*Config, error) {
 		GwellStallTimeout:   envDuration("GWELL_STALL_TIMEOUT", 0),
 		GwellReconnectDelay: envDuration("GWELL_RECONNECT_DELAY", 0),
 		GwellKeepPublisher:  envBool("GWELL_KEEP_PUBLISHER", false),
+		GwellOnDemand:       envBool("GWELL_ON_DEMAND", false),
+		GwellDemandGrace:    envDuration("GWELL_DEMAND_GRACE", 0),
+		GwellPublishRTSP:    env("GWELL_PUBLISH_RTSP", ""),
 		ModelOverrides:      env("MODEL_OVERRIDES", ""),
 
 		// Internals
