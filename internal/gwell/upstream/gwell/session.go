@@ -1,9 +1,9 @@
 package gwell
 
 import (
-	"errors"
 	"crypto/rand"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"log"

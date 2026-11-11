@@ -80,6 +80,9 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 	if cfg.GwellKeepPublisher {
 		extraArgs = append(extraArgs, "--keep-publisher")
 	}
+	if cfg.GwellPace {
+		extraArgs = append(extraArgs, "--pace")
+	}
 
 	backoff := 2 * time.Second
 	const maxBackoff = 60 * time.Second

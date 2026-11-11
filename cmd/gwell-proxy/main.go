@@ -59,10 +59,11 @@ var errTokenFresh = errors.New("token still fresh")
 
 // proxyOpts holds the reconnect tuning flags.
 type proxyOpts struct {
-	stallTimeout   time.Duration
-	reconnectDelay time.Duration
-	keepPublisher  bool
-	relayKeepalive string
+	stallTimeout       time.Duration
+	reconnectDelay     time.Duration
+	keepPublisher      bool
+	relayKeepalive     string
+	pace               bool
 	legacyRelayReplies bool
 }
 
@@ -103,7 +104,7 @@ func (tc *tokenCache) isValid() bool {
 // and (c) accumulate bytesIn/bytesOut so the session-end summary can
 // answer "did we get any video at all?" in one log line.
 type writeTracker struct {
-	inner     *stream.FFmpegPublisher
+	inner     io.Writer      // ffmpeg stdin, or the pacer in front of it
 	dump      io.WriteCloser // nil when --dump-h264 isn't set
 	lastWrite atomic.Int64   // unix nano
 	bytesIn   atomic.Uint64  // raw bytes received from the P2P pipeline
@@ -178,9 +179,10 @@ func main() {
 	flag.DurationVar(&opts.reconnectDelay, "reconnect-delay", reconnectDelay, "wait between a session end and the next attempt (doubles on consecutive failed handshakes, max 1m)")
 	flag.StringVar(&opts.relayKeepalive, "relay-keepalive", "both", "UDP relay keepalive sent every 10s while streaming: both|relay|server|none")
 	flag.BoolVar(&opts.legacyRelayReplies, "legacy-relay-replies", false, "answer frames from a UDP relay with standard (not extended) MTP frames, as before; for A/B tests only")
+	flag.BoolVar(&opts.pace, "pace", false, "split H.264 into access units (AUD), drop invalid NAL units, and feed ffmpeg at the camera frame rate; fixes non-increasing timestamps from bursty relay delivery that browsers reject in HLS")
 	flag.BoolVar(&opts.keepPublisher, "keep-publisher", false, "keep the ffmpeg RTSP publisher (and so the go2rtc producer) alive across P2P reconnects; viewers see a short freeze instead of a stream restart")
 	flag.Parse()
-	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher)
+	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v pace=%v", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher, opts.pace)
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("[main] Wyze GWell P2P proxy starting")
@@ -448,7 +450,7 @@ func streamCamera(client *wyzeShimClient, cameraID string, pub *publisher,
 	// them to --dump-h264 for offline ffprobe inspection, while
 	// tracking last-write time for the deadman switch and byte counts
 	// for the session-end summary.
-	tracker := &writeTracker{inner: ffmpeg}
+	tracker := &writeTracker{inner: pub.writer()}
 	tracker.lastWrite.Store(time.Now().UnixNano())
 	defer tracker.Close()
 	// Session-end summary — one log line tells you whether the session
@@ -500,14 +502,14 @@ func streamCamera(client *wyzeShimClient, cameraID string, pub *publisher,
 	}
 	var streamedFlag atomic.Bool
 	sess := gwell.NewSession(gwell.SessionConfig{
-		Token:        token,
-		ServerAddr:   serverAddr,
-		CameraLanIP:  info.LanIP,
-		DeviceName:   cameraID,
-		H264Writer:   tracker,
-		Devices:      devices,
-		StallTimeout: opts.stallTimeout,
-		RelayKeepalive: opts.relayKeepalive,
+		Token:              token,
+		ServerAddr:         serverAddr,
+		CameraLanIP:        info.LanIP,
+		DeviceName:         cameraID,
+		H264Writer:         tracker,
+		Devices:            devices,
+		StallTimeout:       opts.stallTimeout,
+		RelayKeepalive:     opts.relayKeepalive,
 		LegacyRelayReplies: opts.legacyRelayReplies,
 		OnStreaming: func() {
 			streamedFlag.Store(true)
@@ -600,7 +602,17 @@ func saveCache(tc *tokenCache) {
 // -keep-publisher it outlives P2P sessions, so the go2rtc producer (and
 // every HLS/WebRTC viewer on it) survives a reconnect.
 type publisher struct {
-	ff *stream.FFmpegPublisher
+	ff    *stream.FFmpegPublisher
+	pacer *auPacer // nil unless -pace
+}
+
+// writer returns where session bytes go: the pacer when enabled, else
+// ffmpeg's stdin directly.
+func (p *publisher) writer() io.Writer {
+	if p.pacer != nil {
+		return p.pacer
+	}
+	return p.ff
 }
 
 func (p *publisher) get(streamPath, rtspHost string, rtspPort int, logLevel string) (*stream.FFmpegPublisher, error) {
@@ -613,10 +625,17 @@ func (p *publisher) get(streamPath, rtspHost string, rtspPort int, logLevel stri
 		return nil, err
 	}
 	p.ff = ff
+	if opts.pace {
+		p.pacer = newAUPacer(ff)
+	}
 	return ff, nil
 }
 
 func (p *publisher) close() {
+	if p.pacer != nil {
+		p.pacer.Close()
+		p.pacer = nil
+	}
 	if p.ff != nil {
 		p.ff.Close()
 		p.ff = nil
