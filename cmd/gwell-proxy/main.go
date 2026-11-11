@@ -53,9 +53,6 @@ const (
 	cameraStagger        = 15 * time.Second
 	reconnectDelay       = 10 * time.Second
 	maxReconnectDelay    = 1 * time.Minute
-	// shortSessionLimit: a session that ends sooner than this counts as
-	// a failure for the reconnect backoff.
-	shortSessionLimit = 90 * time.Second
 )
 
 var errTokenFresh = errors.New("token still fresh")
@@ -65,6 +62,8 @@ type proxyOpts struct {
 	stallTimeout   time.Duration
 	reconnectDelay time.Duration
 	keepPublisher  bool
+	relayKeepalive string
+	legacyRelayReplies bool
 }
 
 var opts proxyOpts
@@ -177,6 +176,8 @@ func main() {
 	deadmanTimeout := flag.Duration("deadman-timeout", 2*time.Minute, "max no-data interval before forcing reconnect")
 	flag.DurationVar(&opts.stallTimeout, "stall-timeout", 0, "end a session when no media arrives for this long after streaming starts (0 = rely on -deadman-timeout only); a stalled relay never recovers, so a few seconds gives a fast reconnect")
 	flag.DurationVar(&opts.reconnectDelay, "reconnect-delay", reconnectDelay, "wait between a session end and the next attempt (doubles on consecutive failed handshakes, max 1m)")
+	flag.StringVar(&opts.relayKeepalive, "relay-keepalive", "both", "UDP relay keepalive sent every 10s while streaming: both|relay|server|none")
+	flag.BoolVar(&opts.legacyRelayReplies, "legacy-relay-replies", false, "answer frames from a UDP relay with standard (not extended) MTP frames, as before; for A/B tests only")
 	flag.BoolVar(&opts.keepPublisher, "keep-publisher", false, "keep the ffmpeg RTSP publisher (and so the go2rtc producer) alive across P2P reconnects; viewers see a short freeze instead of a stream restart")
 	flag.Parse()
 	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher)
@@ -378,12 +379,11 @@ func runCamera(client *wyzeShimClient, cameraID string,
 		if !opts.keepPublisher {
 			pub.close()
 		}
-		// Back off when the session failed or streamed only briefly. A
-		// Wyze Cam OG serves one live viewer at a time: a short session
-		// usually means another viewer (the Wyze app, a second bridge)
-		// took the camera, and reconnecting at once would only kick it
-		// back. A session that streamed for a long time resets the delay.
-		if streamed && time.Since(started) >= shortSessionLimit {
+		// A session that streamed and then stalled reconnects after the
+		// base delay: the relay path is gone, a new session is the only
+		// fix. Failed handshakes back off (x2, max 1m) so we do not hammer
+		// the P2P server.
+		if streamed {
 			delay = opts.reconnectDelay
 		} else {
 			delay *= 2
@@ -507,6 +507,8 @@ func streamCamera(client *wyzeShimClient, cameraID string, pub *publisher,
 		H264Writer:   tracker,
 		Devices:      devices,
 		StallTimeout: opts.stallTimeout,
+		RelayKeepalive: opts.relayKeepalive,
+		LegacyRelayReplies: opts.legacyRelayReplies,
 		OnStreaming: func() {
 			streamedFlag.Store(true)
 			// Give the P2P server a moment before the next handshake.

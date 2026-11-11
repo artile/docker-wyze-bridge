@@ -127,6 +127,22 @@ type SessionConfig struct {
 	// the streaming state (handshake done). Callers use it to release
 	// the shared handshake lock early.
 	OnStreaming func()
+
+	// RelayKeepalive selects what the stream loop sends every 10 s to
+	// keep a UDP relay path: "both" (default: re-register with each
+	// relay and send a SessionSocket with the relay ports to the P2P
+	// server), "relay" (only the relay re-registration), "server" (only
+	// the SessionSocket), or "none".
+	RelayKeepalive string
+
+	// LegacyRelayReplies restores the old reply format for frames that
+	// arrive through a UDP relay: a standard MTP frame sent back to the
+	// relay address. The relay cannot route a frame without the
+	// destination TID, so the camera never sees our meter ACKs and KCP
+	// ACKs on that path and drops it after about 20 s. By default the
+	// replies use the extended header (as every other frame we send to a
+	// relay does).
+	LegacyRelayReplies bool
 }
 
 // ErrStreamStalled is returned by Run when the stream loop sees no media
@@ -1603,10 +1619,16 @@ func (s *Session) streamLoop() error {
 			// Relay servers are simple forwarders that only understand MTP
 			// frames — they ignore GUTES (0x7E/0x7F) frames. Without periodic
 			// re-registration the relay tears down after ~20s.
-			if len(s.udpRelayTargets) > 0 {
-				regFrame := BuildTCPRelayRegister(s.linkID, token.AccessID, s.targetDev.TID)
-				for _, rt := range s.udpRelayTargets {
-					pc.WriteToUDP(regFrame, rt.Addr)
+			mode := s.cfg.RelayKeepalive
+			if mode == "" {
+				mode = "both"
+			}
+			if len(s.udpRelayTargets) > 0 && mode != "none" {
+				if mode == "both" || mode == "relay" {
+					regFrame := BuildTCPRelayRegister(s.linkID, token.AccessID, s.targetDev.TID)
+					for _, rt := range s.udpRelayTargets {
+						pc.WriteToUDP(regFrame, rt.Addr)
+					}
 				}
 				// Also tell the P2P server that the relay is still in use
 				var relayPorts []uint16
@@ -1616,10 +1638,12 @@ func (s *Session) streamLoop() error {
 						break
 					}
 				}
-				relayKeep := BuildSessionSocket(token, s.routingSessionID, s.nextSqnum(),
-					s.linkID, s.targetDev.TID, 1, relayPorts, s.pwdKey)
-				pc.WriteToUDP(relayKeep, s.serverUDPAddr)
-				log.Printf("%s relay re-registration sent to %d targets", s.prefix, len(s.udpRelayTargets))
+				if mode == "both" || mode == "server" {
+					relayKeep := BuildSessionSocket(token, s.routingSessionID, s.nextSqnum(),
+						s.linkID, s.targetDev.TID, 1, relayPorts, s.pwdKey)
+					pc.WriteToUDP(relayKeep, s.serverUDPAddr)
+				}
+				log.Printf("%s relay keepalive (%s) sent to %d targets", s.prefix, mode, len(s.udpRelayTargets))
 			}
 
 			lastOnlineSocket = time.Now()
@@ -1736,6 +1760,16 @@ func (s *Session) streamLoop() error {
 			// Feed MTP to KCP
 			sessCmd := FeedMTPToKCP(buf, n, s.dataKCP, s.ctrlKCP, s.convData, s.convCtrl)
 
+			// Frames from a UDP relay carry the extended header; replies to
+			// the relay must carry it too, or the relay cannot forward them.
+			viaRelay := !isFromServer && (buf[1]>>5)&3 != 0 && !s.cfg.LegacyRelayReplies
+			replyFrame := func(payload []byte, urgent bool) []byte {
+				if viaRelay {
+					return BuildExtendedMTPFrame(payload, s.targetDev.TID, urgent)
+				}
+				return BuildMTPFrame(payload, urgent)
+			}
+
 			// Direct ACK for every PUSH (helps with reliability)
 			{
 				mPayOff := MTPPayloadOffset(buf[1])
@@ -1754,7 +1788,7 @@ func (s *Session) streamLoop() error {
 						kcpSN2 := binary.LittleEndian.Uint32(buf[off+12 : off+16])
 						kcpTS := binary.LittleEndian.Uint32(buf[off+8 : off+12])
 						ackSeg := BuildKCPAckSegment(kcpConv, kcpSN2, kcpTS, s.dataKCP.RcvNxt())
-						ackMTP := BuildMTPFrame(ackSeg, false)
+						ackMTP := replyFrame(ackSeg, false)
 						if fromAddr != nil {
 							pc.WriteToUDP(ackMTP, fromAddr)
 						}
@@ -1768,10 +1802,10 @@ func (s *Session) streamLoop() error {
 			if sessCmd == 0x10001 {
 				payOff := MTPPayloadOffset(buf[1])
 				resp := BuildMeterAckFromRequest(buf[payOff:minInt(n, payOff+68)])
-				respFrame := BuildMTPFrame(resp, true)
 				if fromAddr != nil {
-					pc.WriteToUDP(respFrame, fromAddr)
+					pc.WriteToUDP(replyFrame(resp, true), fromAddr)
 				}
+				respFrame := BuildMTPFrame(resp, true)
 				for _, addr := range s.lanMTPAddrs {
 					pc.WriteToUDP(respFrame, addr)
 				}
