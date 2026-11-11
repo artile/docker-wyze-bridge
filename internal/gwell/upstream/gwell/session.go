@@ -1469,6 +1469,14 @@ func (s *Session) streamLoop() error {
 					if !ok {
 						tcpFrameCh = nil
 						draining = false
+						// No relay, no LAN, and the P2P-server TCP fallback
+						// closed: nothing can carry the ACCEPT any more.
+						// Fail now instead of waiting for the caller's
+						// deadman (fast reconnect mode only).
+						if s.cfg.StallTimeout > 0 && len(s.relayAddrs) == 0 &&
+							len(s.lanMTPAddrs) == 0 && len(s.udpRelayTargets) == 0 {
+							return fmt.Errorf("INITREQ: TCP fallback closed before ACCEPT (no relay, no LAN)")
+						}
 						break
 					}
 					if len(frame) >= 6 && frame[0] == 0xC0 {
