@@ -142,3 +142,38 @@ func TestPacerCleanFile(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestPacerMovesParameterSetsToTheirFrame(t *testing.T) {
+	out := &syncBuf{}
+	p := newAUPacer(out)
+	defer p.Close()
+	sps := []byte{0, 0, 0, 1, 0x67, 0x64, 0x00, 0x29}
+	pps := []byte{0, 0, 0, 1, 0x68, 0xee, 0x3c}
+	aud := []byte{0, 0, 0, 1, 0x09, 0xf0}
+	idr := []byte{0, 0, 0, 1, 0x65, 0x88, 0x80}
+	pslice := []byte{0, 0, 0, 1, 0x41, 0x9a, 0x01}
+	cat := func(parts ...[]byte) []byte {
+		var b []byte
+		for _, x := range parts {
+			b = append(b, x...)
+		}
+		return b
+	}
+	// Camera order: SPS PPS AUD IDR | AUD P | SPS PPS AUD IDR | AUD ...
+	p.Write(cat(sps, pps, aud, idr, aud, pslice, sps, pps, aud, idr, aud, pslice))
+	time.Sleep(500 * time.Millisecond)
+	writes, _ := out.snapshot()
+	want := [][]byte{
+		cat(aud, sps, pps, idr),
+		cat(aud, pslice),
+		cat(aud, sps, pps, idr),
+	}
+	if len(writes) != len(want) {
+		t.Fatalf("got %d access units, want %d", len(writes), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(writes[i], want[i]) {
+			t.Fatalf("access unit %d = %x, want %x", i, writes[i], want[i])
+		}
+	}
+}

@@ -32,7 +32,8 @@ type auPacer struct {
 	mu      sync.Mutex
 	pending []byte
 	sawAUD  bool
-	scanned int // bytes inspected while looking for the first AUD
+	scanned int      // bytes inspected while looking for the first AUD
+	carry   [][]byte // SPS/PPS/SEI that belong to the next access unit
 
 	q        chan []byte
 	interval time.Duration // EWMA of the access-unit arrival interval
@@ -78,6 +79,13 @@ func (p *auPacer) Write(b []byte) (int, error) {
 	if !p.sawAUD {
 		if idx := findAUD(p.pending, 0); idx >= 0 {
 			p.sawAUD = true
+			// Parameter sets sent before the first AUD belong to the
+			// first access unit: keep them.
+			for _, n := range splitNALs(p.pending[:idx]) {
+				if isParamOrSEI(n) {
+					p.carry = append(p.carry, n)
+				}
+			}
 			p.pending = p.pending[idx:]
 		} else {
 			p.scanned += len(b)
@@ -90,10 +98,6 @@ func (p *auPacer) Write(b []byte) (int, error) {
 				p.mu.Lock()
 				return len(b), err
 			}
-			// Keep only a tail that can still hold a start code.
-			if len(p.pending) > 8 {
-				p.pending = append([]byte(nil), p.pending[len(p.pending)-8:]...)
-			}
 			return len(b), nil
 		}
 	}
@@ -104,7 +108,7 @@ func (p *auPacer) Write(b []byte) (int, error) {
 		if next < 0 {
 			break
 		}
-		au := cleanAccessUnit(p.pending[:next])
+		au := p.assemble(splitNALs(p.pending[:next]))
 		p.pending = p.pending[next:]
 		p.enqueue(au)
 	}
@@ -187,6 +191,50 @@ func (p *auPacer) Close() {
 	p.once.Do(func() { close(p.done) })
 }
 
+// assemble builds one access unit in decoding order. Wyze cameras send
+// SPS/PPS (and SEI) before the AUD of the frame they belong to, so a cut
+// at the AUD leaves them at the tail of the previous access unit. They
+// are moved to the start of the next one, right after its AUD.
+func (p *auPacer) assemble(nals [][]byte) []byte {
+	lastVCL := -1
+	for i, n := range nals {
+		if t := n[0] & 0x1f; t >= 1 && t <= 5 {
+			lastVCL = i
+		}
+	}
+	if lastVCL < 0 {
+		// No picture: everything is carried to the next access unit.
+		for _, n := range nals {
+			if n[0]&0x1f != 9 {
+				p.carry = append(p.carry, n)
+			}
+		}
+		return nil
+	}
+	var body, tail [][]byte
+	for i, n := range nals {
+		if i > lastVCL && isParamOrSEI(n) {
+			tail = append(tail, n)
+			continue
+		}
+		body = append(body, n)
+	}
+	out := make([][]byte, 0, len(body)+len(p.carry))
+	if len(body) > 0 && body[0][0]&0x1f == 9 {
+		out = append(out, body[0])
+		body = body[1:]
+	}
+	out = append(out, p.carry...)
+	out = append(out, body...)
+	p.carry = tail
+	return joinNALs(out)
+}
+
+func isParamOrSEI(n []byte) bool {
+	t := n[0] & 0x1f
+	return t == 6 || t == 7 || t == 8
+}
+
 // findAUD returns the index of the first Annex B start code (3 or 4
 // bytes) followed by an AUD NAL (type 9) at or after from, or -1.
 func findAUD(b []byte, from int) int {
@@ -263,8 +311,22 @@ func reescapeNAL(nal []byte) []byte {
 // cleanAccessUnit rewrites one access unit with 4-byte start codes and
 // without NAL units that cannot be valid H.264.
 func cleanAccessUnit(au []byte) []byte {
+	return joinNALs(splitNALs(au))
+}
+
+func joinNALs(nals [][]byte) []byte {
 	var out bytes.Buffer
-	out.Grow(len(au))
+	for _, n := range nals {
+		out.Write([]byte{0, 0, 0, 1})
+		out.Write(n)
+	}
+	return out.Bytes()
+}
+
+// splitNALs splits Annex B bytes into NAL units, drops units that cannot
+// be valid H.264 and re-escapes the rest.
+func splitNALs(au []byte) [][]byte {
+	var nals [][]byte
 	start := -1 // index of the first NAL byte
 	emit := func(end int) {
 		if start < 0 || start >= end {
@@ -278,8 +340,7 @@ func cleanAccessUnit(au []byte) []byte {
 		if len(nal) == 0 || nal[0]&0x80 != 0 || nal[0]&0x1f == 0 {
 			return
 		}
-		out.Write([]byte{0, 0, 0, 1})
-		out.Write(reescapeNAL(nal))
+		nals = append(nals, reescapeNAL(nal))
 	}
 	for i := 0; i+2 < len(au); i++ {
 		if au[i] == 0 && au[i+1] == 0 && au[i+2] == 1 {
@@ -289,5 +350,5 @@ func cleanAccessUnit(au []byte) []byte {
 		}
 	}
 	emit(len(au))
-	return out.Bytes()
+	return nals
 }
