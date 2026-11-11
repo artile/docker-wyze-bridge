@@ -30,6 +30,12 @@ func readTestdata(t *testing.T, name string) []byte {
 func TestNALEscaperMatchesFFmpegOnCameraCapture(t *testing.T) {
 	in := readTestdata(t, "og-pframes.h264")
 	want := nalUnits(readTestdata(t, "og-pframes.h264metadata.h264"))
+	// The fixture lacks the IDR slice, so its first AUD starts a frame
+	// with no slice: the escaper drops it, ffmpeg keeps it.
+	if want[0][0]&0x1f != 9 {
+		t.Fatal("fixture does not start with an AUD")
+	}
+	want = want[1:]
 	// The capture is not legal before the rewrite.
 	if !hasUnescapedZeroRun(nalUnits(in)) {
 		t.Fatal("fixture has no unescaped zero run")
@@ -51,16 +57,15 @@ func TestNALEscaperMatchesFFmpegOnCameraCapture(t *testing.T) {
 	}
 }
 
-// escapeTail returns the escaped last NAL unit of b, which the escaper
-// holds until the next start code.
+// escapeTail returns what the escaper still holds after b (the last
+// slice and the units before it); it goes out at the next start code.
 func escapeTail(b []byte) []byte {
 	var out bytes.Buffer
 	e := newNALEscaper(&out)
 	_, _ = e.Write(b)
+	n := out.Len()
 	_, _ = e.Write([]byte{0, 0, 0, 1})
-	all := out.Bytes()
-	i := bytes.LastIndex(all, []byte{0, 0, 0, 1})
-	return all[i:]
+	return out.Bytes()[n:]
 }
 
 func hasUnescapedZeroRun(nals [][]byte) bool {

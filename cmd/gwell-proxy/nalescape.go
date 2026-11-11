@@ -19,13 +19,21 @@ import (
 // unit it:
 //   - trims trailing zero bytes (they belong to the next start code),
 //   - drops units that cannot be H.264 (forbidden_zero_bit set, or
-//     nal_unit_type 0: residue of the IoTVideo framing),
+//     nal_unit_type 0: residue of the IoTVideo framing) and the types a
+//     camera never sends (13..31: SVC/MVC, reserved, and the RTP
+//     aggregation types such as FU-B that the framing residue mimics),
+//   - drops an access unit delimiter (and its SEI) that no slice follows
+//     before the next delimiter: a frame whose slices the relay lost.
+//     Such a frame has no picture, and mediamtx closes its HLS muxer on
+//     it ("access unit doesn't contain an IDR or non-IDR NALU"). SPS and
+//     PPS are kept and go out with the next slice,
 //   - removes and re-inserts emulation prevention bytes (0x03), the same
 //     rewrite ffmpeg's CBS bitstream filters (h264_metadata) do,
 //
-// and writes it with a 4-byte start code. It does not reorder, delay or
-// pace anything: a NAL unit goes out as soon as the next start code
-// arrives. Bytes with no start code pass through unchanged.
+// and writes it with a 4-byte start code. It does not reorder or pace
+// anything: a slice goes out as soon as the next start code arrives, the
+// NAL units before it (AUD, SPS, PPS, SEI) with it. Bytes with no start
+// code pass through unchanged.
 //
 // Make one escaper per P2P session: a partial NAL unit left by a dead
 // session must not be glued to the first bytes of the next one.
@@ -35,7 +43,12 @@ type nalEscaper struct {
 	pending []byte // bytes not yet written, from the current NAL start
 	start   int    // index in pending of the first byte of the current NAL; -1 before the first start code
 	scan    int    // index in pending where the start-code search continues
+
+	held [][]byte // non-VCL NAL units (escaped, with start code) waiting for the next slice
 }
+
+// nalEscaperMaxHeld bounds the held units when no slice arrives.
+const nalEscaperMaxHeld = 32
 
 // nalEscaperMaxPending bounds the buffer when no start code arrives (not
 // Annex B, or a corrupt stream). The buffer is then flushed unchanged.
@@ -60,7 +73,7 @@ func (e *nalEscaper) Write(b []byte) (int, error) {
 			// pass them through as they are.
 			out = append(out, e.pending[:sc]...)
 		} else {
-			out = appendNAL(out, e.pending[e.start:sc])
+			out = e.appendNAL(out, e.pending[e.start:sc])
 		}
 		e.start = sc + scLen
 		e.scan = e.start
@@ -127,16 +140,39 @@ func findStartCode(b []byte, from int) (int, int) {
 }
 
 // appendNAL appends one NAL unit (without its start code) to out with a
-// 4-byte start code, or appends nothing when the unit is not H.264.
-func appendNAL(out, nal []byte) []byte {
+// 4-byte start code, holds it until the next slice, or drops it.
+func (e *nalEscaper) appendNAL(out, nal []byte) []byte {
 	for len(nal) > 0 && nal[len(nal)-1] == 0 {
 		nal = nal[:len(nal)-1]
 	}
-	if len(nal) == 0 || nal[0]&0x80 != 0 || nal[0]&0x1f == 0 {
+	if len(nal) == 0 || nal[0]&0x80 != 0 {
 		return out
 	}
-	out = append(out, 0, 0, 0, 1)
-	return appendEscaped(out, nal)
+	switch t := nal[0] & 0x1f; {
+	case t >= 1 && t <= 5: // slice: the held units of its access unit go first
+		for _, h := range e.held {
+			out = append(out, h...)
+		}
+		e.held = e.held[:0]
+		out = append(out, 0, 0, 0, 1)
+		return appendEscaped(out, nal)
+	case t == 9: // AUD: an earlier AUD that got no slice is a lost frame
+		kept := e.held[:0]
+		for _, h := range e.held {
+			if ht := h[4] & 0x1f; ht == 7 || ht == 8 {
+				kept = append(kept, h)
+			}
+		}
+		e.held = kept
+	case t >= 6 && t <= 12: // SEI, SPS, PPS, end of sequence/stream, filler
+	default: // 0 and 13..31: not from a camera encoder
+		return out
+	}
+	if len(e.held) >= nalEscaperMaxHeld {
+		e.held = append(e.held[:0], e.held[1:]...)
+	}
+	e.held = append(e.held, appendEscaped([]byte{0, 0, 0, 1}, nal))
+	return out
 }
 
 // appendEscaped appends nal to out with valid emulation prevention.
