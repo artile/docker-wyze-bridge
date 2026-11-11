@@ -20,7 +20,8 @@ import (
 // The pacer splits the byte stream into access units at the AUD NAL
 // (type 9, which Wyze Gwell cameras send before every frame), drops NAL
 // units that cannot be valid H.264 (forbidden_zero_bit set, or type 0:
-// residue of the IoTVideo framing), and writes one access unit at a time
+// residue of the IoTVideo framing), re-escapes zero runs inside NAL
+// units (see reescapeNAL), and writes one access unit at a time
 // at the measured frame interval. A small queue absorbs the bursts; a
 // growing queue makes the pacer catch up, so latency stays bounded.
 //
@@ -165,11 +166,7 @@ func (p *auPacer) run() {
 			// Catch up gently: up to 25 % faster than the camera.
 			iv = iv * 3 / 4
 		}
-		now := time.Now()
-		if next.Before(now) || depth == 0 && next.Sub(now) > pacerMaxInterval {
-			next = now
-		}
-		if wait := next.Sub(now); wait > 0 {
+		if wait := time.Until(next); wait > 0 {
 			select {
 			case <-p.done:
 				return
@@ -179,7 +176,9 @@ func (p *auPacer) run() {
 		if _, err := p.out.Write(au); err != nil {
 			return
 		}
-		next = next.Add(iv)
+		// Schedule from the real write time: a late timer must not make
+		// the next frame go out back to back.
+		next = time.Now().Add(iv)
 	}
 }
 
@@ -205,6 +204,62 @@ func findAUD(b []byte, from int) int {
 	return -1
 }
 
+// reescapeNAL removes and re-inserts emulation prevention bytes.
+//
+// Wyze Gwell cameras send slice NAL units with runs of zero bytes that
+// are not escaped ("00 00 00" inside a NAL is illegal in Annex B).
+// Software decoders ignore it; Apple VideoToolbox (Chrome and Safari on
+// macOS/iOS) rejects every such frame (kVTVideoDecoderBadDataErr). This
+// is the same rewrite ffmpeg's CBS-based bitstream filters do.
+func reescapeNAL(nal []byte) []byte {
+	// Fast path: nothing to escape.
+	need := false
+	for i := 2; i < len(nal); i++ {
+		if nal[i-2] == 0 && nal[i-1] == 0 && nal[i] <= 3 {
+			need = true
+			break
+		}
+	}
+	if !need && nal[len(nal)-1] != 0 {
+		return nal
+	}
+	// Unescape: drop 0x03 that follows two zero bytes.
+	rbsp := make([]byte, 0, len(nal))
+	zeros := 0
+	for _, c := range nal {
+		if zeros >= 2 && c == 3 {
+			zeros = 0
+			continue
+		}
+		rbsp = append(rbsp, c)
+		if c == 0 {
+			zeros++
+		} else {
+			zeros = 0
+		}
+	}
+	// Escape: insert 0x03 before any byte <= 3 that follows two zeros,
+	// and after a final zero byte.
+	out := make([]byte, 0, len(rbsp)+len(rbsp)/64+2)
+	zeros = 0
+	for _, c := range rbsp {
+		if zeros >= 2 && c <= 3 {
+			out = append(out, 3)
+			zeros = 0
+		}
+		out = append(out, c)
+		if c == 0 {
+			zeros++
+		} else {
+			zeros = 0
+		}
+	}
+	if out[len(out)-1] == 0 {
+		out = append(out, 3)
+	}
+	return out
+}
+
 // cleanAccessUnit rewrites one access unit with 4-byte start codes and
 // without NAL units that cannot be valid H.264.
 func cleanAccessUnit(au []byte) []byte {
@@ -224,7 +279,7 @@ func cleanAccessUnit(au []byte) []byte {
 			return
 		}
 		out.Write([]byte{0, 0, 0, 1})
-		out.Write(nal)
+		out.Write(reescapeNAL(nal))
 	}
 	for i := 0; i+2 < len(au); i++ {
 		if au[i] == 0 && au[i+1] == 0 && au[i+2] == 1 {

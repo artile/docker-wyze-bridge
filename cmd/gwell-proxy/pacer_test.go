@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"sync"
 	"testing"
 	"time"
@@ -86,5 +87,58 @@ func TestPacerPassesThroughStreamWithoutAUD(t *testing.T) {
 	writes, _ := out.snapshot()
 	if len(writes) == 0 {
 		t.Fatal("no pass-through output for a stream without AUD")
+	}
+}
+
+func TestPacerDropsTrailingC0Residue(t *testing.T) {
+	// Seen on a Wyze Cam OG: a P slice, zero padding, then "00 00 01 c0 00".
+	au := []byte{0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x41, 0x9a, 0x11, 0x22,
+		0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0xc0, 0x00}
+	got := cleanAccessUnit(au)
+	want := []byte{0, 0, 0, 1, 0x09, 0xf0, 0, 0, 0, 1, 0x41, 0x9a, 0x11, 0x22}
+	if !bytes.Equal(got, want) {
+		t.Fatalf("clean = %x, want %x", got, want)
+	}
+}
+
+func TestReescapeNALEscapesZeroRuns(t *testing.T) {
+	cases := []struct{ in, want []byte }{
+		{[]byte{0x41, 1, 0, 0, 0, 0, 0x35}, []byte{0x41, 1, 0, 0, 3, 0, 0, 0x35}},
+		{[]byte{0x41, 0, 0, 0, 0, 0, 0}, []byte{0x41, 0, 0, 3, 0, 0, 3, 0, 0, 3}},
+		{[]byte{0x41, 0, 0, 3, 1}, []byte{0x41, 0, 0, 3, 1}}, // already escaped
+		{[]byte{0x41, 5, 6}, []byte{0x41, 5, 6}},
+		{[]byte{0x41, 0, 0, 1}, []byte{0x41, 0, 0, 3, 1}},
+	}
+	for _, c := range cases {
+		if got := reescapeNAL(c.in); !bytes.Equal(got, c.want) {
+			t.Errorf("reescapeNAL(%x) = %x, want %x", c.in, got, c.want)
+		}
+	}
+}
+
+// TestPacerCleanFile rewrites an Annex B file with cleanAccessUnit when
+// PACER_IN/PACER_OUT are set (manual check against a hardware decoder).
+func TestPacerCleanFile(t *testing.T) {
+	in, out := os.Getenv("PACER_IN"), os.Getenv("PACER_OUT")
+	if in == "" || out == "" {
+		t.Skip("PACER_IN/PACER_OUT not set")
+	}
+	d, err := os.ReadFile(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var res []byte
+	start := findAUD(d, 0)
+	for start >= 0 {
+		next := findAUD(d, start+4)
+		end := next
+		if end < 0 {
+			end = len(d)
+		}
+		res = append(res, cleanAccessUnit(d[start:end])...)
+		start = next
+	}
+	if err := os.WriteFile(out, res, 0o644); err != nil {
+		t.Fatal(err)
 	}
 }
