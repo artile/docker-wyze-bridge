@@ -1,6 +1,7 @@
 package gwell
 
 import (
+	"errors"
 	"crypto/rand"
 	"encoding/binary"
 	"fmt"
@@ -114,7 +115,24 @@ type SessionConfig struct {
 	DeviceName  string       // target device name filter
 	H264Writer  io.Writer    // receives decoded H.264 data (optional)
 	Devices     []DeviceInfo // pre-populated device list (skips initInfo if set)
+
+	// StallTimeout ends the stream loop with ErrStreamStalled when no
+	// media arrives for this long after streaming started. Zero disables
+	// the check (the caller's own watchdog then decides). A stalled Gwell
+	// relay never recovers inside the same session, so a short value
+	// (a few seconds) gives a fast reconnect instead of a long freeze.
+	StallTimeout time.Duration
+
+	// OnStreaming, when set, is called once when the session enters
+	// the streaming state (handshake done). Callers use it to release
+	// the shared handshake lock early.
+	OnStreaming func()
 }
+
+// ErrStreamStalled is returned by Run when the stream loop sees no media
+// for SessionConfig.StallTimeout, or when its only transport (the TCP
+// relay) is gone.
+var ErrStreamStalled = errors.New("stream stalled")
 
 // Session manages the full lifecycle of a P2P camera connection.
 type Session struct {
@@ -164,6 +182,7 @@ type Session struct {
 	lastMeterRecv time.Time // last time we received any meter frame (REQ or ACK)
 	meterReqCount int       // incoming meter REQUESTs from camera (since last log)
 	meterAckCount int       // incoming meter ACKs from camera (since last log)
+	lastMediaAt   time.Time // last time the DATA KCP delivered media
 
 	// Lifecycle
 	state  SessionState
@@ -1504,6 +1523,11 @@ func (s *Session) streamLoop() error {
 	// Main stream loop
 	s.state = StateStreaming
 	log.Printf("%s streaming started", s.prefix)
+	if s.cfg.OnStreaming != nil {
+		s.cfg.OnStreaming()
+	}
+	streamStart := time.Now()
+	relayOnly := s.bestLanAddr == nil && len(s.lanMTPAddrs) == 0 && len(s.udpRelayTargets) == 0
 
 	lastHeartbeat := time.Now()
 	lastStatus := time.Now()
@@ -1512,6 +1536,24 @@ func (s *Session) streamLoop() error {
 	lastStreamRenew := time.Now()
 
 	for !s.isClosed() {
+		// Stall check: a dead relay does not come back inside the same
+		// session. End the loop so the caller reconnects at once.
+		if s.cfg.StallTimeout > 0 {
+			last, limit := s.lastMediaAt, s.cfg.StallTimeout
+			if last.IsZero() {
+				// The first frame can take a few seconds after START.
+				last = streamStart
+				if limit < 10*time.Second {
+					limit = 10 * time.Second
+				}
+			}
+			if idle := time.Since(last); idle > limit {
+				log.Printf("%s no media for %s (stall timeout %s)", s.prefix, idle.Round(time.Millisecond), s.cfg.StallTimeout)
+				s.logDeathDiagnostics()
+				return fmt.Errorf("%w: no media for %s", ErrStreamStalled, idle.Round(time.Second))
+			}
+		}
+
 		// AVSTREAM session renewal every 15 seconds.
 		// The Wyze doorbell firmware (battery-design lineage) has a ~20-25s
 		// live-view session window. Without periodic INITREQ renewals on the
@@ -1613,6 +1655,11 @@ func (s *Session) streamLoop() error {
 					if !ok {
 						tcpFrameCh = nil
 						keepDraining = false
+						if relayOnly && s.cfg.StallTimeout > 0 {
+							log.Printf("%s TCP relay closed and no other media path", s.prefix)
+							s.logDeathDiagnostics()
+							return fmt.Errorf("%w: TCP relay closed", ErrStreamStalled)
+						}
 						break
 					}
 					if len(frame) >= 6 && frame[0] == 0xC0 {
@@ -1759,7 +1806,12 @@ func (s *Session) streamLoop() error {
 		}
 	}
 
-	// Death diagnostics — log full KCP state when stream ends
+	s.logDeathDiagnostics()
+	return nil
+}
+
+// logDeathDiagnostics logs the full KCP state when a stream ends.
+func (s *Session) logDeathDiagnostics() {
 	ds := s.dataKCP.Stats()
 	cs := s.ctrlKCP.Stats()
 	meterAge := "never"
@@ -1774,7 +1826,6 @@ func (s *Session) streamLoop() error {
 		s.prefix, cs.RcvNxt, cs.RcvQueueLen, cs.RcvBufLen, cs.SndUna, cs.SndNxt, cs.SndBufLen+cs.SndQueueLen, cs.RmtWnd, cs.CWnd, cs.Retransmits, cs.SNDropOld, cs.SNDropAhead)
 	log.Printf("%s  meter: sent=%d lastRecv=%s | bestLAN: %v | lastDataFrom: %s",
 		s.prefix, s.meterRound, meterAge, s.bestLanAddr, s.lastDataFrom)
-	return nil
 }
 
 // drainKCPRecv processes all available data from KCP receive queues.
@@ -1786,6 +1837,7 @@ func (s *Session) drainKCPRecv() {
 		}
 		s.streamPkts++
 		s.streamDataBytes += len(data)
+		s.lastMediaAt = time.Now()
 		if len(data) > 0 {
 			h264 := DecryptMTPPayload(data, s.mtpRC5Ctx, "DATA")
 			if h264 != nil && s.cfg.H264Writer != nil {
