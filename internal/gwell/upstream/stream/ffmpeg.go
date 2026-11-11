@@ -33,10 +33,17 @@ type FFmpegPublisher struct {
 // wallclock timestamps are rounded to: a rate below the camera's frame
 // rate gives two frames the same timestamp (a Wyze Cam OG sends 20 fps,
 // so -r 15 makes every fourth frame a duplicate that browsers drop).
-// Empty means 15, as before.
+// As an input option -r also makes the timestamps close to constant
+// rate, whatever the wallclock says. "0" leaves -r out: the timestamps
+// are then the wallclock read times, which is right when the input is
+// paced (gwell-proxy -pace). Empty means 15, as before.
 func StartFFmpegPublisher(streamPath, rtspHost string, rtspPort int, logLevel, inputRate string) (*FFmpegPublisher, error) {
 	if inputRate == "" {
 		inputRate = "15"
+	}
+	rateArgs := []string{"-r", inputRate}
+	if inputRate == "0" {
+		rateArgs = nil
 	}
 	if logLevel == "" {
 		logLevel = "info"
@@ -83,11 +90,13 @@ func StartFFmpegPublisher(streamPath, rtspHost string, rtspPort int, logLevel, i
 	//   -avoid_negative_ts make_zero rebases the first RTP timestamp
 	//     to 0 rather than a large wallclock-derived value.
 	//
-	cmd := exec.Command("ffmpeg",
+	args := []string{
 		"-loglevel", logLevel,
 		"-use_wallclock_as_timestamps", "1",
 		"-fflags", "+genpts+igndts+nobuffer",
-		"-r", inputRate,
+	}
+	args = append(args, rateArgs...)
+	args = append(args,
 		"-f", "h264",
 		"-i", "pipe:0",
 		"-c:v", "copy",
@@ -97,6 +106,7 @@ func StartFFmpegPublisher(streamPath, rtspHost string, rtspPort int, logLevel, i
 		"-rtsp_transport", "tcp",
 		rtspURL,
 	)
+	cmd := exec.Command("ffmpeg", args...)
 
 	stdin, err := cmd.StdinPipe()
 	if err != nil {

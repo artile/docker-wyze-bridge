@@ -195,7 +195,7 @@ func main() {
 	flag.BoolVar(&opts.onDemand, "on-demand", false, "stream a camera only while a GET /demand/<stream> request is open on -control-addr (e.g. a mediamtx runOnDemand hook)")
 	flag.DurationVar(&opts.demandGrace, "demand-grace", 10*time.Second, "with -on-demand: end the session after the last viewer has been gone this long")
 	flag.BoolVar(&opts.pace, "pace", false, "write H.264 to ffmpeg one access unit per measured frame interval; smooths the bursts of the relay so frames get distinct timestamps (needs -escape-nal)")
-	flag.StringVar(&opts.ffmpegRate, "ffmpeg-rate", "15", "ffmpeg input -r; set it to the camera frame rate or above (Wyze Cam OG: 20), or frames share a timestamp and browsers drop them")
+	flag.StringVar(&opts.ffmpegRate, "ffmpeg-rate", "15", "ffmpeg input -r (near-constant-rate timestamps); 0 = no -r, wallclock timestamps (use with -pace)")
 	flag.BoolVar(&opts.keepPublisher, "keep-publisher", false, "keep the ffmpeg RTSP publisher (and so the go2rtc producer) alive across P2P reconnects; viewers see a short freeze instead of a stream restart")
 	flag.Parse()
 	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v escape-nal=%v pace=%v ffmpeg-rate=%s", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher, opts.escapeNAL, opts.pace, opts.ffmpegRate)
