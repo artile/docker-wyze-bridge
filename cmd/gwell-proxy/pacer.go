@@ -18,7 +18,9 @@ import (
 //
 // The pacer takes clean Annex B (behind the nalEscaper) and cuts it into
 // access units where H.264 7.4.1.2.3 says a new one starts: at the first
-// AUD, SPS, PPS or SEI after a slice. It never reorders or changes a NAL
+// AUD, SPS, PPS or SEI after a slice, or at a slice with
+// first_mb_in_slice 0 (a new picture; Wyze Cam OG streams over the relay
+// carry no AUD at all). It never reorders or changes a NAL
 // unit. A queue absorbs the bursts and one access unit goes out per
 // measured frame interval; when the queue grows the pacer catches up, so
 // latency stays bounded.
@@ -70,7 +72,11 @@ func (p *auPacer) Write(b []byte) (int, error) {
 	for _, nal := range splitStartCodes(b) {
 		t := nal[4] & 0x1f
 		vcl := t >= 1 && t <= 5
-		if !vcl && p.sawVCL && (t == 6 || t == 7 || t == 8 || t == 9) {
+		// first_mb_in_slice is the first ue(v) of the slice header: 0
+		// is the single bit 1, so the byte after the NAL header has its
+		// top bit set.
+		newPicture := vcl && len(nal) > 5 && nal[5]&0x80 != 0
+		if p.sawVCL && (newPicture || t == 6 || t == 7 || t == 8 || t == 9) {
 			p.enqueue(p.pending)
 			p.pending = nil
 			p.sawVCL = false

@@ -65,3 +65,37 @@ func TestPacerSpacesABurstAndKeepsNALOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestPacerCutsAStreamWithoutAUDAtEachPicture(t *testing.T) {
+	var w timedWriter
+	p := newAUPacer(&w)
+	defer p.Close()
+	idr := []byte{0, 0, 0, 1, 0x67, 0x64, 0, 0, 0, 1, 0x68, 0xee, 0, 0, 0, 1, 0x65, 0x88}
+	p1 := []byte{0, 0, 0, 1, 0x41, 0x9a, 0, 0, 0, 1, 0x41, 0x2b} // two slices: first_mb 0, then first_mb > 0
+	p2 := []byte{0, 0, 0, 1, 0x41, 0x9a}
+	var in []byte
+	in = append(in, idr...)
+	in = append(in, p1...)
+	in = append(in, p2...)
+	in = append(in, p2...) // stays open
+	if _, err := p.Write(in); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if writes, _ := w.snapshot(); len(writes) == 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	writes, _ := w.snapshot()
+	want := [][]byte{idr, p1, p2}
+	if len(writes) != len(want) {
+		t.Fatalf("%d writes, want %d", len(writes), len(want))
+	}
+	for i := range want {
+		if !bytes.Equal(writes[i], want[i]) {
+			t.Fatalf("write %d = % x, want % x", i, writes[i], want[i])
+		}
+	}
+}
