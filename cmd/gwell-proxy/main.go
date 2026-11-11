@@ -64,6 +64,7 @@ type proxyOpts struct {
 	keepPublisher  bool
 	relayKeepalive string
 	legacyRelayReplies bool
+	escapeNAL          bool
 }
 
 var opts proxyOpts
@@ -103,7 +104,7 @@ func (tc *tokenCache) isValid() bool {
 // and (c) accumulate bytesIn/bytesOut so the session-end summary can
 // answer "did we get any video at all?" in one log line.
 type writeTracker struct {
-	inner     *stream.FFmpegPublisher
+	inner     io.Writer      // ffmpeg stdin, or the NAL escaper in front of it
 	dump      io.WriteCloser // nil when --dump-h264 isn't set
 	lastWrite atomic.Int64   // unix nano
 	bytesIn   atomic.Uint64  // raw bytes received from the P2P pipeline
@@ -178,9 +179,10 @@ func main() {
 	flag.DurationVar(&opts.reconnectDelay, "reconnect-delay", reconnectDelay, "wait between a session end and the next attempt (doubles on consecutive failed handshakes, max 1m)")
 	flag.StringVar(&opts.relayKeepalive, "relay-keepalive", "both", "UDP relay keepalive sent every 10s while streaming: both|relay|server|none")
 	flag.BoolVar(&opts.legacyRelayReplies, "legacy-relay-replies", false, "answer frames from a UDP relay with standard (not extended) MTP frames, as before; for A/B tests only")
+	flag.BoolVar(&opts.escapeNAL, "escape-nal", true, "rewrite each H.264 NAL unit with valid emulation prevention bytes and drop invalid units before ffmpeg; Wyze Cam OG slices carry unescaped zero runs that hardware decoders (Apple VideoToolbox in Chrome/Safari) reject")
 	flag.BoolVar(&opts.keepPublisher, "keep-publisher", false, "keep the ffmpeg RTSP publisher (and so the go2rtc producer) alive across P2P reconnects; viewers see a short freeze instead of a stream restart")
 	flag.Parse()
-	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher)
+	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v escape-nal=%v", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher, opts.escapeNAL)
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("[main] Wyze GWell P2P proxy starting")
@@ -448,7 +450,13 @@ func streamCamera(client *wyzeShimClient, cameraID string, pub *publisher,
 	// them to --dump-h264 for offline ffprobe inspection, while
 	// tracking last-write time for the deadman switch and byte counts
 	// for the session-end summary.
-	tracker := &writeTracker{inner: ffmpeg}
+	// The escaper is per session: a partial NAL unit left by a dead
+	// session is dropped, not glued to the next session's first bytes.
+	var sink io.Writer = ffmpeg
+	if opts.escapeNAL {
+		sink = newNALEscaper(ffmpeg)
+	}
+	tracker := &writeTracker{inner: sink}
 	tracker.lastWrite.Store(time.Now().UnixNano())
 	defer tracker.Close()
 	// Session-end summary — one log line tells you whether the session
