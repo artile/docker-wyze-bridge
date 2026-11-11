@@ -134,6 +134,7 @@ type Config struct {
 	GwellOnDemand        bool          // gwell-proxy -on-demand (control API on GwellControlPort)
 	GwellDemandGrace     time.Duration // gwell-proxy -demand-grace (0 = proxy default)
 	GwellPublishRTSP     string        // host:port gwell-proxy publishes to (empty = embedded go2rtc 127.0.0.1:8554)
+	GwellFFmpegRate      string        // gwell-proxy -ffmpeg-rate (empty = proxy default 15)
 	// ModelOverrides is the raw MODEL_OVERRIDES string applied to the
 	// wyzeapi model registry at startup. See wyzeapi.ApplyModelOverrides.
 	ModelOverrides string
@@ -275,6 +276,7 @@ func Load() (*Config, error) {
 		GwellOnDemand:       envBool("GWELL_ON_DEMAND", false),
 		GwellDemandGrace:    envDuration("GWELL_DEMAND_GRACE", 0),
 		GwellPublishRTSP:    env("GWELL_PUBLISH_RTSP", ""),
+		GwellFFmpegRate:     env("GWELL_FFMPEG_RATE", ""),
 		ModelOverrides:      env("MODEL_OVERRIDES", ""),
 
 		// Internals

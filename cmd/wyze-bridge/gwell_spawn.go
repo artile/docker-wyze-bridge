@@ -92,6 +92,9 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 	if cfg.GwellKeepPublisher {
 		extraArgs = append(extraArgs, "--keep-publisher")
 	}
+	if cfg.GwellFFmpegRate != "" {
+		extraArgs = append(extraArgs, "--ffmpeg-rate", cfg.GwellFFmpegRate)
+	}
 	// GWELL_ON_DEMAND: the camera streams only while a viewer holds
 	// GET /demand/<stream> open on the control port (a media server's
 	// on-demand hook). GET /health on the same port lists the cameras.

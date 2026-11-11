@@ -28,7 +28,16 @@ type FFmpegPublisher struct {
 // "warning" — the debug setting produces dozens of lines per frame
 // which drowns out everything else in the bridge log; flip to debug
 // only when diagnosing ffmpeg itself.
-func StartFFmpegPublisher(streamPath, rtspHost string, rtspPort int, logLevel string) (*FFmpegPublisher, error) {
+//
+// inputRate is ffmpeg's input -r. It also sets the time base the
+// wallclock timestamps are rounded to: a rate below the camera's frame
+// rate gives two frames the same timestamp (a Wyze Cam OG sends 20 fps,
+// so -r 15 makes every fourth frame a duplicate that browsers drop).
+// Empty means 15, as before.
+func StartFFmpegPublisher(streamPath, rtspHost string, rtspPort int, logLevel, inputRate string) (*FFmpegPublisher, error) {
+	if inputRate == "" {
+		inputRate = "15"
+	}
 	if logLevel == "" {
 		logLevel = "info"
 	}
@@ -78,7 +87,7 @@ func StartFFmpegPublisher(streamPath, rtspHost string, rtspPort int, logLevel st
 		"-loglevel", logLevel,
 		"-use_wallclock_as_timestamps", "1",
 		"-fflags", "+genpts+igndts+nobuffer",
-		"-r", "15",
+		"-r", inputRate,
 		"-f", "h264",
 		"-i", "pipe:0",
 		"-c:v", "copy",
