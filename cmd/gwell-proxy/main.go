@@ -69,6 +69,7 @@ type proxyOpts struct {
 	onDemand           bool
 	demandGrace        time.Duration
 	ffmpegRate         string
+	pace               bool
 }
 
 // demand tracks viewers per stream (-on-demand) and serves -control-addr.
@@ -193,10 +194,11 @@ func main() {
 	controlAddr := flag.String("control-addr", "", "listen address of the control API (GET /health, GET /demand/<stream>), e.g. :18564; empty = off")
 	flag.BoolVar(&opts.onDemand, "on-demand", false, "stream a camera only while a GET /demand/<stream> request is open on -control-addr (e.g. a mediamtx runOnDemand hook)")
 	flag.DurationVar(&opts.demandGrace, "demand-grace", 10*time.Second, "with -on-demand: end the session after the last viewer has been gone this long")
+	flag.BoolVar(&opts.pace, "pace", false, "write H.264 to ffmpeg one access unit per measured frame interval; smooths the bursts of the relay so frames get distinct timestamps (needs -escape-nal)")
 	flag.StringVar(&opts.ffmpegRate, "ffmpeg-rate", "15", "ffmpeg input -r; set it to the camera frame rate or above (Wyze Cam OG: 20), or frames share a timestamp and browsers drop them")
 	flag.BoolVar(&opts.keepPublisher, "keep-publisher", false, "keep the ffmpeg RTSP publisher (and so the go2rtc producer) alive across P2P reconnects; viewers see a short freeze instead of a stream restart")
 	flag.Parse()
-	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v escape-nal=%v", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher, opts.escapeNAL)
+	log.Printf("[main] deadman=%s stall=%s reconnect-delay=%s keep-publisher=%v escape-nal=%v pace=%v ffmpeg-rate=%s", *deadmanTimeout, opts.stallTimeout, opts.reconnectDelay, opts.keepPublisher, opts.escapeNAL, opts.pace, opts.ffmpegRate)
 
 	log.SetFlags(log.Ldate | log.Ltime | log.Lmicroseconds)
 	log.Println("[main] Wyze GWell P2P proxy starting")
@@ -486,8 +488,13 @@ func streamCamera(client *wyzeShimClient, cameraID, streamPath string, pub *publ
 	// The escaper is per session: a partial NAL unit left by a dead
 	// session is dropped, not glued to the next session's first bytes.
 	var sink io.Writer = ffmpeg
+	if opts.pace && opts.escapeNAL {
+		pacer := newAUPacer(ffmpeg)
+		defer pacer.Close()
+		sink = pacer
+	}
 	if opts.escapeNAL {
-		sink = newNALEscaper(ffmpeg)
+		sink = newNALEscaper(sink)
 	}
 	tracker := &writeTracker{inner: sink}
 	tracker.lastWrite.Store(time.Now().UnixNano())

@@ -92,6 +92,9 @@ func spawnGwellProxy(ctx context.Context, cfg *config.Config, log zerolog.Logger
 	if cfg.GwellKeepPublisher {
 		extraArgs = append(extraArgs, "--keep-publisher")
 	}
+	if cfg.GwellPace {
+		extraArgs = append(extraArgs, "--pace")
+	}
 	if cfg.GwellFFmpegRate != "" {
 		extraArgs = append(extraArgs, "--ffmpeg-rate", cfg.GwellFFmpegRate)
 	}
